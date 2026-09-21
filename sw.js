@@ -1,58 +1,58 @@
-// Service Worker برای آتش‌کاو
-var CACHE_NAME = 'atashkav-v2';
-var urlsToCache = [
-    './',
-    './index.html',
-    './manifest.json'
-];
-
-// نصب
-self.addEventListener('install', function(event) {
-    console.log('🔧 Service Worker نصب شد');
-    event.waitUntil(
-        caches.open(CACHE_NAME).then(function(cache) {
-            return cache.addAll(urlsToCache);
-        })
-    );
-    self.skipWaiting();
-});
-
-// فعال‌سازی
-self.addEventListener('activate', function(event) {
-    console.log('✅ Service Worker فعال شد');
-    event.waitUntil(
-        caches.keys().then(function(cacheNames) {
-            return Promise.all(
-                cacheNames.map(function(cacheName) {
-                    if (cacheName !== CACHE_NAME) {
-                        return caches.delete(cacheName);
-                    }
-                })
-            );
-        })
-    );
-    self.clients.claim();
-});
-
-// رهگیری درخواست‌ها
-self.addEventListener('fetch', function(event) {
-    event.respondWith(
-        caches.match(event.request).then(function(response) {
-            if (response) return response;
-            return fetch(event.request).then(function(response) {
-                // کش کردن درخواست‌های موفق
-                if (!response || response.status !== 200 || response.type !== 'basic') {
-                    return response;
-                }
-                var responseToCache = response.clone();
-                caches.open(CACHE_NAME).then(function(cache) {
-                    cache.put(event.request, responseToCache);
-                });
-                return response;
-            });
-        }).catch(function() {
-            // آفلاین: برگرداندن صفحه اصلی
-            return caches.match('./index.html');
-        })
-    );
-});
+{
+    "name": "آتش‌کاو - AtashKav",
+    "short_name": "آتش‌کاو",
+    "description": "سیستم هدایت آتش و ناوبری نظامی",
+    "id": "ir.atashkav.app",
+    "start_url": "./index.html",
+    "display": "standalone",
+    "display_override": ["standalone", "fullscreen"],
+    "orientation": "any",
+    "background_color": "#0A0A0A",
+    "theme_color": "#FF6B00",
+    "lang": "fa",
+    "dir": "rtl",
+    "scope": "./",
+    "prefer_related_applications": false,
+    "related_applications": [],
+    "categories": ["navigation", "utilities", "productivity"],
+    "icons": [
+        {
+            "src": "logo.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "logo.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "logo.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "logo.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ],
+    "shortcuts": [
+        {
+            "name": "هدایت آتش",
+            "short_name": "هدایت",
+            "url": "./index.html?panel=fire",
+            "icons": [{ "src": "logo.png", "sizes": "192x192" }]
+        },
+        {
+            "name": "نقشه",
+            "short_name": "نقشه",
+            "url": "./index.html?panel=map",
+            "icons": [{ "src": "logo.png", "sizes": "192x192" }]
+        }
+    ]
+}
