@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>آتشکاو - AtashKav</title>
-    
+    <link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#FF6B00">
+<link rel="apple-touch-icon" href="icon-192.png">
     <!-- ===== لینک‌های CDN ===== -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
@@ -62902,6 +62904,705 @@ setTimeout(function() {
     console.log('═══════════════════════════════════════');
 
 })();
+</script>
+<!-- ================================================================ -->
+<!-- 📱 Fallback برای APK - جایگزین File System Access API            -->
+<!-- ================================================================ -->
+<script>
+(function APKStorageFallback() {
+    'use strict';
+
+    if (window.__APK_STORAGE_FALLBACK__) return;
+    window.__APK_STORAGE_FALLBACK__ = true;
+
+    console.log('📱 APK Storage Fallback - بررسی...');
+
+    // ============================================================
+    // 🔍 تشخیص WebView / APK
+    // ============================================================
+    var isWebView = !window.showDirectoryPicker ||
+                    /wv|WebView/i.test(navigator.userAgent) ||
+                    (typeof window.AndroidFunction !== 'undefined') ||
+                    /; wv\)/.test(navigator.userAgent);
+
+    console.log('📱 تشخیص WebView:', isWebView);
+
+    if (!isWebView) {
+        console.log('ℹ️ این کد فقط در APK فعال می‌شود');
+        return;
+    }
+
+    // ============================================================
+    // 💾 سیستم ذخیره‌سازی IndexedDB جایگزین پوشه
+    // ============================================================
+    var DB_NAME = 'atashkav_storage';
+    var DB_VERSION = 1;
+    var STORE_NAME = 'files';
+    var _db = null;
+
+    function openDB() {
+        return new Promise(function(resolve, reject) {
+            if (_db) { resolve(_db); return; }
+            var req = indexedDB.open(DB_NAME, DB_VERSION);
+            req.onupgradeneeded = function(e) {
+                var db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    db.createObjectStore(STORE_NAME, { keyPath: 'path' });
+                }
+            };
+            req.onsuccess = function(e) {
+                _db = e.target.result;
+                resolve(_db);
+            };
+            req.onerror = function(e) {
+                reject(e.target.error);
+            };
+        });
+    }
+
+    // ============================================================
+    // 📁 کلاس شبیه‌ساز پوشه
+    // ============================================================
+    function VirtualFolderHandle(path) {
+        this.kind = 'directory';
+        this.name = path.split('/').pop() || 'root';
+        this.__path = path;
+        this.__isVirtual = true;
+    }
+
+    VirtualFolderHandle.prototype.getDirectoryHandle = async function(name, opts) {
+        opts = opts || {};
+        var newPath = this.__path ? this.__path + '/' + name : name;
+        return new VirtualFolderHandle(newPath);
+    };
+
+    VirtualFolderHandle.prototype.getFileHandle = async function(name, opts) {
+        opts = opts || {};
+        var newPath = this.__path ? this.__path + '/' + name : name;
+        return new VirtualFileHandle(newPath);
+    };
+
+    VirtualFolderHandle.prototype.removeEntry = async function(name) {
+        var db = await openDB();
+        var fullPath = this.__path ? this.__path + '/' + name : name;
+
+        // حذف خود فایل
+        await new Promise(function(resolve) {
+            var tx = db.transaction(STORE_NAME, 'readwrite');
+            var store = tx.objectStore(STORE_NAME);
+            store.delete(fullPath);
+            tx.oncomplete = resolve;
+        });
+
+        // حذف زیرفایل‌ها
+        var allKeys = await new Promise(function(resolve) {
+            var tx = db.transaction(STORE_NAME, 'readonly');
+            var store = tx.objectStore(STORE_NAME);
+            var req = store.getAllKeys();
+            req.onsuccess = function() { resolve(req.result); };
+            req.onerror = function() { resolve([]); };
+        });
+
+        var toDelete = allKeys.filter(function(k) {
+            return typeof k === 'string' && k.indexOf(fullPath + '/') === 0;
+        });
+
+        for (var i = 0; i < toDelete.length; i++) {
+            await new Promise(function(resolve) {
+                var tx = db.transaction(STORE_NAME, 'readwrite');
+                var store = tx.objectStore(STORE_NAME);
+                store.delete(toDelete[i]);
+                tx.oncomplete = resolve;
+            });
+        }
+    };
+
+    VirtualFolderHandle.prototype.values = function() {
+        var self = this;
+        var iterator = {
+            _index: 0,
+            _items: [],
+            _ready: false
+        };
+
+        // بارگذاری لیست فایل‌ها
+        (async function() {
+            var db = await openDB();
+            var allKeys = await new Promise(function(resolve) {
+                var tx = db.transaction(STORE_NAME, 'readonly');
+                var store = tx.objectStore(STORE_NAME);
+                var req = store.getAllKeys();
+                req.onsuccess = function() { resolve(req.result); };
+                req.onerror = function() { resolve([]); };
+            });
+
+            var prefix = self.__path ? self.__path + '/' : '';
+            var seen = {};
+
+            allKeys.forEach(function(key) {
+                if (typeof key !== 'string') return;
+                if (prefix && key.indexOf(prefix) !== 0) return;
+
+                var rest = prefix ? key.substring(prefix.length) : key;
+                var parts = rest.split('/');
+                var immediateName = parts[0];
+                if (!immediateName) return;
+
+                if (seen[immediateName]) return;
+                seen[immediateName] = true;
+
+                if (parts.length === 1) {
+                    iterator._items.push({
+                        kind: 'file',
+                        name: immediateName,
+                        __path: key,
+                        getFile: async function() {
+                            return await readFile(key);
+                        }
+                    });
+                } else {
+                    iterator._items.push(new VirtualFolderHandle(
+                        prefix + immediateName
+                    ));
+                }
+            });
+
+            iterator._ready = true;
+        })();
+
+        return {
+            [Symbol.asyncIterator]: function() {
+                return {
+                    next: async function() {
+                        while (!iterator._ready) {
+                            await new Promise(function(r) { setTimeout(r, 10); });
+                        }
+                        if (iterator._index >= iterator._items.length) {
+                            return { done: true };
+                        }
+                        return { value: iterator._items[iterator._index++], done: false };
+                    }
+                };
+            }
+        };
+    };
+
+    // ============================================================
+    // 📄 کلاس شبیه‌ساز فایل
+    // ============================================================
+    function VirtualFileHandle(path) {
+        this.kind = 'file';
+        this.name = path.split('/').pop() || '';
+        this.__path = path;
+        this.__isVirtual = true;
+    }
+
+    VirtualFileHandle.prototype.getFile = async function() {
+        return await readFile(this.__path);
+    };
+
+    VirtualFileHandle.prototype.createWritable = async function() {
+        var path = this.__path;
+        return {
+            write: async function(data) {
+                var content;
+                if (typeof data === 'string') {
+                    content = data;
+                } else if (data instanceof Blob) {
+                    content = await blobToBase64(data);
+                } else {
+                    content = String(data);
+                }
+
+                var db = await openDB();
+                return new Promise(function(resolve, reject) {
+                    var tx = db.transaction(STORE_NAME, 'readwrite');
+                    var store = tx.objectStore(STORE_NAME);
+                    store.put({
+                        path: path,
+                        content: content,
+                        isBlob: data instanceof Blob,
+                        savedAt: Date.now()
+                    });
+                    tx.oncomplete = resolve;
+                    tx.onerror = function(e) { reject(e.target.error); };
+                });
+            },
+            close: async function() {}
+        };
+    };
+
+    async function readFile(path) {
+        var db = await openDB();
+        var record = await new Promise(function(resolve) {
+            var tx = db.transaction(STORE_NAME, 'readonly');
+            var store = tx.objectStore(STORE_NAME);
+            var req = store.get(path);
+            req.onsuccess = function() { resolve(req.result); };
+            req.onerror = function() { resolve(null); };
+        });
+
+        if (!record) {
+            // فایل خالی برگردان
+            return new File([''], path.split('/').pop(), { type: 'text/plain' });
+        }
+
+        if (record.isBlob) {
+            var blob = base64ToBlob(record.content);
+            return new File([blob], path.split('/').pop(), { type: blob.type });
+        }
+
+        return new File([record.content], path.split('/').pop(), { type: 'text/plain' });
+    }
+
+    function blobToBase64(blob) {
+        return new Promise(function(resolve) {
+            var reader = new FileReader();
+            reader.onload = function() { resolve(reader.result); };
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function base64ToBlob(dataURI) {
+        var parts = dataURI.split(',');
+        var byteString = atob(parts[1]);
+        var mimeMatch = parts[0].match(/:(.*?);/);
+        var mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+        var ab = new ArrayBuffer(byteString.length);
+        var ia = new Uint8Array(ab);
+        for (var i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
+        }
+        return new Blob([ab], { type: mime });
+    }
+
+    // ============================================================
+    // 🎯 Override selectStorageFolder
+    // ============================================================
+    var originalSelect = window.selectStorageFolder;
+
+    window.selectStorageFolder = async function() {
+        console.log('📱 انتخاب پوشه در APK - استفاده از IndexedDB');
+
+        // نمایش مودال اطلاعات
+        showAPKFolderModal();
+    };
+
+    function showAPKFolderModal() {
+        var old = document.getElementById('apk-folder-modal');
+        if (old) old.remove();
+
+        var modal = document.createElement('div');
+        modal.id = 'apk-folder-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);' +
+            'z-index:2147483647;display:flex;justify-content:center;align-items:center;' +
+            'padding:15px;font-family:BTitr,Vazir;box-sizing:border-box;direction:rtl;';
+
+        modal.innerHTML = '<div style="background:#1A1A1A;border:2px solid #FF6B00;' +
+            'border-radius:14px;padding:22px;max-width:400px;width:100%;text-align:center;' +
+            'box-shadow:0 15px 60px rgba(0,0,0,0.95);">' +
+                '<div style="font-size:52px;margin-bottom:12px;">📱</div>' +
+                '<div style="color:#FF6B00;font-size:17px;font-weight:bold;margin-bottom:12px;">' +
+                'حالت اپلیکیشن اندروید</div>' +
+                '<div style="color:#B0B0B0;font-size:13px;line-height:1.8;margin-bottom:16px;">' +
+                'در اپلیکیشن اندروید، فایل‌ها به صورت داخلی در حافظه اپ ذخیره می‌شوند ' +
+                'و نیازی به انتخاب پوشه نیست.<br>' +
+                '<span style="color:#4CAF50;font-weight:bold;">همه چیز به صورت خودکار کار می‌کند ✅</span>' +
+                '</div>' +
+                '<div style="background:#0A0A0A;border:1px solid #2A2A2A;border-radius:8px;' +
+                'padding:12px;margin-bottom:16px;font-size:11px;color:#888;text-align:right;line-height:1.8;">' +
+                '📁 <b style="color:#FFD700;">محل ذخیره‌سازی:</b><br>' +
+                '<span style="color:#FFF;font-family:monospace;direction:ltr;">' +
+                'Internal Storage / IndexedDB</span><br><br>' +
+                '💡 <b style="color:#FFD700;">نکته:</b> برای انتقال فایل‌ها به کامپیوتر، ' +
+                'از دکمه‌های <span style="color:#4CAF50;">خروجی Excel</span> و ' +
+                '<span style="color:#CC3300;">خروجی PDF</span> استفاده کنید ' +
+                'که فایل را دانلود می‌کنند.' +
+                '</div>' +
+                '<button id="apk-folder-ok" style="width:100%;padding:14px;' +
+                'background:#4CAF50;border:none;border-radius:10px;color:#FFF;' +
+                'font-family:inherit;font-size:14px;font-weight:bold;cursor:pointer;">' +
+                '✅ متوجه شدم</button>' +
+            '</div>';
+
+        document.body.appendChild(modal);
+
+        setTimeout(function() {
+            var okBtn = document.getElementById('apk-folder-ok');
+            if (okBtn) {
+                okBtn.onclick = async function() {
+                    modal.remove();
+                    await initVirtualFolders();
+                };
+            }
+        }, 50);
+    }
+
+    // ============================================================
+    // 📂 راه‌اندازی پوشه‌های مجازی
+    // ============================================================
+    async function initVirtualFolders() {
+        // ساخت پوشه ریشه
+        var storageHandle = new VirtualFolderHandle('storage');
+
+        // ساخت زیرپوشه‌ها
+        var libraryHandle = await storageHandle.getDirectoryHandle('کتابخانه', { create: true });
+        var backupHandle = await storageHandle.getDirectoryHandle('بکاپ', { create: true });
+        var mapHandle = await storageHandle.getDirectoryHandle('نقشه', { create: true });
+        var pointsHandle = await storageHandle.getDirectoryHandle('نقاط', { create: true });
+        var elevationHandle = await storageHandle.getDirectoryHandle('ارتفاع', { create: true });
+
+        // به‌روزرسانی dataMenu
+        if (!window.dataMenu) window.dataMenu = {};
+        window.dataMenu.storageFolderHandle = storageHandle;
+        window.dataMenu.libraryFolderHandle = libraryHandle;
+        window.dataMenu.backupFolderHandle = backupHandle;
+        window.dataMenu.mapFolderHandle = mapHandle;
+        window.dataMenu.pointsFolderHandle = pointsHandle;
+        window.dataMenu.elevationFolderHandle = elevationHandle;
+
+        // به‌روزرسانی UI
+        var pathDisplay = document.getElementById('storage-folder-path');
+        if (pathDisplay) pathDisplay.value = 'حافظه داخلی اپلیکیشن';
+
+        var statusDisplay = document.getElementById('storage-folder-status');
+        if (statusDisplay) {
+            statusDisplay.textContent = '✅ فعال (IndexedDB)';
+            statusDisplay.style.color = '#4CAF50';
+        }
+
+        var subfolders = document.getElementById('storage-subfolders');
+        if (subfolders) {
+            subfolders.innerHTML = 
+                '<span style="background:#1A3A1A;padding:2px 10px;border-radius:12px;' +
+                'border:1px solid #4CAF50;font-size:10px;color:#4CAF50;">📚 کتابخانه ✅</span>' +
+                '<span style="background:#1A3A1A;padding:2px 10px;border-radius:12px;' +
+                'border:1px solid #4CAF50;font-size:10px;color:#4CAF50;">💾 بکاپ ✅</span>' +
+                '<span style="background:#1A3A1A;padding:2px 10px;border-radius:12px;' +
+                'border:1px solid #4CAF50;font-size:10px;color:#4CAF50;">🗺️ نقشه ✅</span>' +
+                '<span style="background:#1A3A1A;padding:2px 10px;border-radius:12px;' +
+                'border:1px solid #4CAF50;font-size:10px;color:#4CAF50;">📍 نقاط ✅</span>' +
+                '<span style="background:#1A3A1A;padding:2px 10px;border-radius:12px;' +
+                'border:1px solid #4CAF50;font-size:10px;color:#4CAF50;">🏔️ ارتفاع ✅</span>';
+        }
+
+        // اتصال سیستم ارتفاع
+        if (window.ElevationSystem && window.ElevationSystem.connect) {
+            try {
+                await window.ElevationSystem.connect(storageHandle);
+            } catch(e) {}
+        }
+
+        // سیو در localStorage برای بازیابی
+        localStorage.setItem('atashkav_apk_mode', 'true');
+
+        console.log('✅ پوشه‌های مجازی راه‌اندازی شد');
+    }
+
+    // ============================================================
+    // 🔄 بازیابی خودکار در بارگذاری
+    // ============================================================
+    async function autoRestore() {
+        if (localStorage.getItem('atashkav_apk_mode') === 'true') {
+            await initVirtualFolders();
+            console.log('✅ حالت APK بازیابی شد');
+        }
+    }
+
+    setTimeout(autoRestore, 2000);
+
+    // ============================================================
+    // 📌 API
+    // ============================================================
+    window.APKStorage = {
+        isWebView: isWebView,
+        init: initVirtualFolders,
+        showModal: showAPKFolderModal,
+        debug: function() {
+            console.log('═══════════════════════════════════════');
+            console.log('📱 APK Storage Debug');
+            console.log('───────────────────────────────────────');
+            console.log('WebView:', isWebView);
+            console.log('حالت APK فعال:', localStorage.getItem('atashkav_apk_mode'));
+            console.log('dataMenu موجود:', !!window.dataMenu);
+            if (window.dataMenu) {
+                console.log('پوشه نقاط:', !!window.dataMenu.pointsFolderHandle);
+                console.log('پوشه بکاپ:', !!window.dataMenu.backupFolderHandle);
+                console.log('پوشه کتابخانه:', !!window.dataMenu.libraryFolderHandle);
+                console.log('پوشه نقشه:', !!window.dataMenu.mapFolderHandle);
+            }
+            console.log('═══════════════════════════════════════');
+        },
+        reset: function() {
+            localStorage.removeItem('atashkav_apk_mode');
+            indexedDB.deleteDatabase(DB_NAME);
+            console.log('🗑️ حالت APK ریست شد');
+        },
+        exportAll: async function() {
+            // خروجی گرفتن از همه فایل‌ها
+            var db = await openDB();
+            var all = await new Promise(function(resolve) {
+                var tx = db.transaction(STORE_NAME, 'readonly');
+                var store = tx.objectStore(STORE_NAME);
+                var req = store.getAll();
+                req.onsuccess = function() { resolve(req.result); };
+            });
+
+            var blob = new Blob([JSON.stringify(all, null, 2)], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'atashkav_backup_' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+    };
+
+    console.log('═══════════════════════════════════════');
+    console.log('✅ APK Storage Fallback نصب شد');
+    console.log('   APKStorage.debug()');
+    console.log('   APKStorage.exportAll()');
+    console.log('═══════════════════════════════════════');
+
+})();
+</script>
+<!-- ================================================================ -->
+<!-- 📱 بهینه‌سازی UI برای موبایل                                     -->
+<!-- ================================================================ -->
+<script>
+(function MobileUIOptimizer() {
+    'use strict';
+
+    if (window.__MOBILE_UI__) return;
+    window.__MOBILE_UI__ = true;
+
+    console.log('📱 Mobile UI Optimizer - شروع...');
+
+    var styleEl = document.createElement('style');
+    styleEl.id = 'mobile-ui-optimizer-styles';
+    styleEl.textContent = `
+        /* ================================================================ */
+        /* موبایل: هدر شناور فشرده‌تر                                      */
+        /* ================================================================ */
+        @media (max-width: 600px) {
+            #ak-float-header {
+                top: 4px !important;
+                left: 4px !important;
+                min-width: 180px !important;
+                max-width: 220px !important;
+                border-radius: 8px !important;
+            }
+
+            #ak-float-header .ak-fh-title {
+                padding: 4px 8px !important;
+            }
+
+            #ak-float-header .ak-fh-brand {
+                font-size: 11px !important;
+            }
+
+            #ak-float-header .ak-fh-content {
+                padding: 5px 8px 6px 8px !important;
+            }
+
+            #ak-float-header .ak-fh-row {
+                font-size: 9px !important;
+                margin-bottom: 3px !important;
+            }
+
+            #ak-float-header .ak-fh-label {
+                font-size: 8px !important;
+                min-width: 38px !important;
+            }
+
+            #ak-float-header .ak-fh-value {
+                font-size: 9px !important;
+            }
+
+            #ak-float-header .ak-fh-value-fa {
+                font-size: 10px !important;
+            }
+
+            #ak-float-header .ak-fh-value-fa .num {
+                font-size: 10px !important;
+            }
+
+            /* ============================================================ */
+            /* دکمه‌های شناور - کوچک‌تر                                      */
+            /* ============================================================ */
+            #gnss-locate-btn {
+                width: 40px !important;
+                height: 40px !important;
+                font-size: 17px !important;
+                bottom: 80px !important;
+                right: 12px !important;
+            }
+
+            #coord-search-btn {
+                width: 40px !important;
+                height: 40px !important;
+                font-size: 17px !important;
+                bottom: 130px !important;
+                right: 12px !important;
+            }
+
+            #gnss-panel-toggle {
+                width: 40px !important;
+                height: 40px !important;
+                font-size: 17px !important;
+                top: 55px !important;
+                right: 12px !important;
+            }
+
+            /* ============================================================ */
+            /* دکمه‌های کنترل نقشه                                          */
+            /* ============================================================ */
+            .map-controls button {
+                width: 38px !important;
+                height: 38px !important;
+                font-size: 16px !important;
+            }
+
+            .map-controls.left {
+                bottom: 130px !important;
+                left: 10px !important;
+            }
+
+            /* ============================================================ */
+            /* کراس‌ایر - اندازه مناسب موبایل                               */
+            /* ============================================================ */
+            #crosshair .circle {
+                width: 26px !important;
+                height: 26px !important;
+            }
+
+            #crosshair .h-line {
+                width: 36px !important;
+                height: 2px !important;
+            }
+
+            #crosshair .v-line {
+                width: 2px !important;
+                height: 36px !important;
+            }
+
+            /* ============================================================ */
+            /* پنل ناوبری - وسط بالای صفحه                                  */
+            /* ============================================================ */
+            #nav-panel {
+                min-width: 260px !important;
+                max-width: 320px !important;
+                top: 4px !important;
+                padding: 6px 10px !important;
+            }
+
+            /* ============================================================ */
+            /* پنل هدایت آتش - فشرده‌تر                                     */
+            /* ============================================================ */
+            #panel-fire .fire-panel-container {
+                max-height: 95vh !important;
+                border-radius: 12px !important;
+            }
+
+            #panel-fire .fire-panel-header {
+                padding: 10px 14px !important;
+            }
+
+            #panel-fire .fire-panel-title {
+                font-size: 15px !important;
+            }
+
+            #panel-fire .fire-content {
+                padding: 10px !important;
+            }
+
+            #panel-fire .fire-section {
+                padding: 10px 12px !important;
+                margin-bottom: 10px !important;
+            }
+
+            #panel-fire .fire-section-title {
+                font-size: 12px !important;
+                margin-bottom: 8px !important;
+            }
+
+            /* ============================================================ */
+            /* نوار منوی پایین - فشرده‌تر                                   */
+            /* ============================================================ */
+            #bottom-menu {
+                padding: 4px 0 6px 0 !important;
+                min-height: 50px !important;
+            }
+
+            #bottom-menu .menu-item {
+                font-size: 9px !important;
+                padding: 2px 2px !important;
+            }
+
+            #bottom-menu .menu-item i {
+                font-size: 16px !important;
+                margin-bottom: 1px !important;
+            }
+
+            /* ============================================================ */
+            /* نتیجه محاسبات هدایت آتش - فشرده                              */
+            /* ============================================================ */
+            .fire-info-box {
+                padding: 10px 12px !important;
+                margin-bottom: 8px !important;
+            }
+
+            .fire-info-row {
+                font-size: 11px !important;
+                padding: 3px 0 !important;
+            }
+
+            .fire-info-row .val {
+                font-size: 11px !important;
+            }
+
+            /* ============================================================ */
+            /* تب‌های هدایت آتش                                            */
+            /* ============================================================ */
+            .fire-tabs {
+                padding: 6px 8px 0 8px !important;
+            }
+
+            .fire-tab-btn {
+                font-size: 10px !important;
+                padding: 8px 4px !important;
+            }
+
+            .fire-tab-btn .tab-icon {
+                font-size: 15px !important;
+            }
+        }
+
+        /* ================================================================ */
+        /* اطمینان از عدم همپوشانی هدر با پنل ناوبری                      */
+        /* ================================================================ */
+        @media (max-width: 600px) {
+            body.navigating #ak-float-header {
+                display: none !important;
+            }
+        }
+    `;
+    document.head.appendChild(styleEl);
+    console.log('✅ Mobile UI Optimizer نصب شد');
+
+})();
+</script>
+<script>
+// ثبت Service Worker
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js')
+        .then(function(reg) {
+            console.log('✅ Service Worker ثبت شد');
+        })
+        .catch(function(err) {
+            console.warn('⚠️ خطا در ثبت:', err);
+        });
+}
 </script>
 <!-- کتابخانه shp-write برای ذخیره Shapefile                         -->
 <!-- ================================================================ -->
